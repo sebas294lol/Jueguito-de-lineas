@@ -1,0 +1,1305 @@
+package com.trayectoriadetiro.doscuatro;
+
+import android.app.Activity;
+import android.os.Bundle;
+import android.graphics.*;
+import android.view.*;
+import android.content.Context;
+import android.os.SystemClock;
+import java.util.Random;
+
+public class MainActivity extends Activity {
+
+    private GameView game;
+
+    @Override
+    public void onCreate(Bundle b) {
+        super.onCreate(b);
+
+        getWindow().setFlags(
+                WindowManager.LayoutParams.FLAG_FULLSCREEN,
+                WindowManager.LayoutParams.FLAG_FULLSCREEN
+        );
+
+        game = new GameView(this);
+        setContentView(game);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (game != null) game.startLoop();
+    }
+
+    @Override
+    protected void onPause() {
+        if (game != null) game.stopLoop();
+        super.onPause();
+    }
+
+    public static final class GameView extends View {
+
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+        private final Random rng = new Random();
+
+        private boolean running;
+        private long lastNanos;
+
+        /*
+         * 0 = menú
+         * 1 = retos
+         * 2 = modo portero
+         * 3 = penales
+         * 4 = tiros libres
+         * 5 = 1 vs 1
+         */
+        private int mode = 0;
+        private int difficulty = 1;
+
+        private float power = 7f;
+        private float curve = 0f;
+        private float height = 45f;
+
+        private float ballX, ballY;
+        private float startX, startY;
+        private float targetX, targetY;
+
+        private float shotT;
+        private float shotDuration = 1f;
+
+        private boolean shooting;
+        private boolean shotResolved;
+
+        private float keeperX, keeperY;
+        private float keeperTX, keeperTY;
+        private float keeperVX, keeperVY;
+
+        private boolean diving;
+        private float diveT;
+
+        private float playerT;
+        private float goalPulse;
+
+        private int goals;
+        private int saves;
+        private int shots;
+        private int streak;
+        private int record;
+
+        private int challengeGoal = 5;
+        private int challengeProgress;
+
+        private float botTimer;
+
+        private final RectF goal = new RectF();
+        private final RectF field = new RectF();
+
+        public GameView(Context c) {
+            super(c);
+
+            setFocusable(true);
+
+            stroke.setStyle(Paint.Style.STROKE);
+            stroke.setStrokeCap(Paint.Cap.ROUND);
+
+            text.setTypeface(
+                    Typeface.create(
+                            Typeface.DEFAULT,
+                            Typeface.BOLD
+                    )
+            );
+
+            reset();
+        }
+
+        /*
+         * BUCLE DE ANIMACIÓN
+         *
+         * Este es uno de los cambios importantes:
+         * la animación NO depende de tocar botones.
+         */
+        public void startLoop() {
+
+            if (running) return;
+
+            running = true;
+
+            lastNanos = System.nanoTime();
+
+            removeCallbacks(loop);
+
+            postOnAnimation(loop);
+        }
+
+        public void stopLoop() {
+
+            running = false;
+
+            removeCallbacks(loop);
+        }
+
+        private final Runnable loop = new Runnable() {
+
+            @Override
+            public void run() {
+
+                if (!running) return;
+
+                long now = System.nanoTime();
+
+                float dt =
+                        (now - lastNanos)
+                        / 1000000000f;
+
+                lastNanos = now;
+
+                /*
+                 * Evita saltos enormes cuando Android
+                 * tarda en entregar un frame.
+                 */
+                if (dt > 0.05f)
+                    dt = 0.05f;
+
+                update(dt);
+
+                invalidate();
+
+                postOnAnimation(this);
+            }
+        };
+
+        /*
+         * UPDATE GENERAL
+         */
+        private void update(float dt) {
+
+            if (goalPulse > 0) {
+
+                goalPulse -= dt * 3f;
+
+                if (goalPulse < 0)
+                    goalPulse = 0;
+            }
+
+            /*
+             * Animación del jugador.
+             */
+            if (playerT < 1) {
+
+                playerT += dt * 3.8f;
+
+                if (playerT > 1)
+                    playerT = 1;
+            }
+
+            /*
+             * El bot del Modo Portero
+             * dispara automáticamente.
+             */
+            if (mode == 2 && !shooting) {
+
+                botTimer += dt;
+
+                if (botTimer >= 1.0f) {
+
+                    botTimer = 0;
+
+                    botShoot();
+                }
+            }
+
+            /*
+             * Actualización del balón.
+             */
+            if (shooting) {
+
+                shotT += dt / shotDuration;
+
+                if (shotT > 1)
+                    shotT = 1;
+
+                updateBall(shotT);
+
+                updateKeeper(dt);
+
+                if (shotT >= 1 &&
+                        !shotResolved) {
+
+                    resolveShot();
+                }
+            }
+
+            /*
+             * Animación de la atajada.
+             */
+            if (diving) {
+
+                diveT += dt / 0.42f;
+
+                if (diveT >= 1) {
+
+                    diveT = 1;
+
+                    diving = false;
+                }
+            }
+        }
+
+        /*
+         * FÍSICA DEL BALÓN
+         */
+        private void updateBall(float t) {
+
+            /*
+             * Smoothstep para que el balón
+             * acelere y desacelere naturalmente.
+             */
+            float smooth =
+                    t * t * (3 - 2 * t);
+
+            float x =
+                    startX +
+                    (targetX - startX) * smooth;
+
+            float y =
+                    startY +
+                    (targetY - startY) * smooth;
+
+            /*
+             * Curva lateral.
+             */
+            float curveOffset =
+                    (float)Math.sin(
+                            Math.PI * t
+                    ) * curve * 3.0f;
+
+            /*
+             * Altura.
+             */
+            float lift =
+                    (float)Math.sin(
+                            Math.PI * t
+                    ) *
+                    (height / 100f) *
+                    250f;
+
+            ballX = x + curveOffset;
+
+            ballY = y - lift;
+        }
+
+        /*
+         * IA DEL PORTERO
+         */
+        private void updateKeeper(float dt) {
+
+            if (mode == 2)
+                return;
+
+            float speed;
+
+            if (difficulty == 0)
+                speed = 3.0f;
+            else if (difficulty == 1)
+                speed = 4.5f;
+            else
+                speed = 6.5f;
+
+            keeperVX +=
+                    (keeperTX - keeperX)
+                    * speed * dt;
+
+            keeperVY +=
+                    (keeperTY - keeperY)
+                    * speed * dt;
+
+            keeperVX *= 0.78f;
+            keeperVY *= 0.78f;
+
+            keeperX += keeperVX;
+            keeperY += keeperVY;
+
+            clampKeeper();
+        }
+
+        private void clampKeeper() {
+
+            float pad = 18;
+
+            keeperX =
+                    Math.max(
+                            goal.left + pad,
+                            Math.min(
+                                    goal.right - pad,
+                                    keeperX
+                            )
+                    );
+
+            /*
+             * TODO EL ARCO.
+             *
+             * No existe la barrera invisible
+             * que había en la versión anterior.
+             */
+            keeperY =
+                    Math.max(
+                            goal.top + pad,
+                            Math.min(
+                                    goal.bottom - pad,
+                                    keeperY
+                            )
+                    );
+        }
+
+        /*
+         * ELECCIÓN DE LA ATAJADA
+         */
+        private void chooseKeeperTarget() {
+
+            float error;
+
+            if (difficulty == 0)
+                error = 55;
+            else if (difficulty == 1)
+                error = 30;
+            else
+                error = 17;
+
+            keeperTX =
+                    targetX +
+                    (rng.nextFloat() * 2 - 1)
+                    * error;
+
+            keeperTY =
+                    targetY +
+                    (rng.nextFloat() * 2 - 1)
+                    * error;
+
+            clampTarget();
+        }
+
+        private void clampTarget() {
+
+            float pad = 12;
+
+            keeperTX =
+                    Math.max(
+                            goal.left + pad,
+                            Math.min(
+                                    goal.right - pad,
+                                    keeperTX
+                            )
+                    );
+
+            keeperTY =
+                    Math.max(
+                            goal.top + pad,
+                            Math.min(
+                                    goal.bottom - pad,
+                                    keeperTY
+                            )
+                    );
+        }
+
+        /*
+         * DISPARO
+         */
+        private void shoot(
+                float tx,
+                float ty
+        ) {
+
+            if (shooting)
+                return;
+
+            shots++;
+
+            shooting = true;
+
+            shotResolved = false;
+
+            shotT = 0;
+
+            playerT = 0;
+
+            targetX = tx;
+            targetY = ty;
+
+            startX =
+                    getWidth() * 0.16f;
+
+            startY =
+                    getHeight() * 0.60f;
+
+            ballX = startX;
+            ballY = startY;
+
+            /*
+             * Más potencia = menos tiempo
+             * de vuelo.
+             */
+            shotDuration =
+                    Math.max(
+                            0.55f,
+                            1.48f -
+                            power * 0.078f
+                    );
+
+            chooseKeeperTarget();
+        }
+
+        /*
+         * BOT DEL MODO PORTERO
+         */
+        private void botShoot() {
+
+            float tx =
+                    goal.left +
+                    goal.width() *
+                    (0.12f +
+                    0.76f *
+                    rng.nextFloat());
+
+            float ty =
+                    goal.top +
+                    goal.height() *
+                    (0.10f +
+                    0.80f *
+                    rng.nextFloat());
+
+            if (difficulty == 0) {
+
+                power =
+                        4 +
+                        rng.nextFloat() * 2;
+
+                curve =
+                        -8 +
+                        rng.nextFloat() * 16;
+
+                height =
+                        25 +
+                        rng.nextFloat() * 25;
+
+            } else if (difficulty == 1) {
+
+                power =
+                        6 +
+                        rng.nextFloat() * 2.5f;
+
+                curve =
+                        -18 +
+                        rng.nextFloat() * 36;
+
+                height =
+                        30 +
+                        rng.nextFloat() * 40;
+
+            } else {
+
+                power =
+                        7.5f +
+                        rng.nextFloat() * 2.5f;
+
+                curve =
+                        -30 +
+                        rng.nextFloat() * 60;
+
+                height =
+                        20 +
+                        rng.nextFloat() * 65;
+            }
+
+            shoot(tx, ty);
+        }
+
+        /*
+         * DETECCIÓN DEL GOL
+         *
+         * El balón debe estar dentro de la portería.
+         * Si pasa por arriba del larguero,
+         * NO cuenta como gol.
+         */
+        private boolean insideGoal() {
+
+            return
+                    ballX >= goal.left + 7 &&
+                    ballX <= goal.right - 7 &&
+                    ballY >= goal.top + 7 &&
+                    ballY <= goal.bottom - 7;
+        }
+
+        /*
+         * DETECCIÓN DE ATAJADA
+         */
+        private boolean saved() {
+
+            float dx =
+                    ballX - keeperX;
+
+            float dy =
+                    ballY - keeperY;
+
+            float distanceSquared =
+                    dx * dx + dy * dy;
+
+            float radius;
+
+            if (difficulty == 0)
+                radius = 52;
+            else if (difficulty == 1)
+                radius = 40;
+            else
+                radius = 31;
+
+            return
+                    distanceSquared <=
+                    radius * radius;
+        }
+
+        /*
+         * FINAL DEL TIRO
+         */
+        private void resolveShot() {
+
+            shotResolved = true;
+
+            shooting = false;
+
+            boolean goalScored =
+                    insideGoal();
+
+            boolean save =
+                    saved();
+
+            if (goalScored && !save) {
+
+                goals++;
+
+                streak++;
+
+                if (streak > record)
+                    record = streak;
+
+                goalPulse = 1;
+
+                if (mode == 1)
+                    challengeProgress++;
+
+            } else {
+
+                if (save)
+                    saves++;
+
+                streak = 0;
+            }
+
+            /*
+             * PROGRESO DE RETOS
+             */
+            if (mode == 1 &&
+                    challengeProgress >=
+                    challengeGoal) {
+
+                challengeGoal =
+                        Math.min(
+                                20,
+                                challengeGoal + 2
+                        );
+
+                challengeProgress = 0;
+            }
+        }
+
+        /*
+         * RESET
+         */
+        private void reset() {
+
+            shooting = false;
+
+            shotResolved = false;
+
+            shots = 0;
+            goals = 0;
+            saves = 0;
+            streak = 0;
+
+            challengeGoal = 5;
+            challengeProgress = 0;
+
+            botTimer = 0;
+
+            power = 7;
+            curve = 0;
+            height = 45;
+
+            startX =
+                    getWidth() * 0.16f;
+
+            startY =
+                    getHeight() * 0.60f;
+
+            ballX = startX;
+            ballY = startY;
+
+            targetX =
+                    getWidth() * 0.82f;
+
+            targetY =
+                    getHeight() * 0.50f;
+
+            keeperX =
+                    getWidth() * 0.81f;
+
+            keeperY =
+                    getHeight() * 0.50f;
+
+            keeperTX = keeperX;
+            keeperTY = keeperY;
+        }
+
+        /*
+         * AJUSTE DE PANTALLA
+         */
+        @Override
+        protected void onSizeChanged(
+                int w,
+                int h,
+                int oldW,
+                int oldH
+        ) {
+
+            field.set(
+                    20,
+                    20,
+                    w - 20,
+                    h - 20
+            );
+
+            goal.set(
+                    w * 0.68f,
+                    h * 0.24f,
+                    w * 0.94f,
+                    h * 0.73f
+            );
+        }
+
+        /*
+         * RENDER
+         */
+        @Override
+        protected void onDraw(Canvas canvas) {
+
+            super.onDraw(canvas);
+
+            if (mode == 0)
+                drawMenu(canvas);
+            else
+                drawGame(canvas);
+        }
+
+        /*
+         * MENÚ
+         */
+        private void drawMenu(Canvas c) {
+
+            c.drawColor(
+                    Color.rgb(15,30,20)
+            );
+
+            text.setTextAlign(
+                    Paint.Align.CENTER
+            );
+
+            text.setColor(Color.WHITE);
+
+            text.setTextSize(34);
+
+            c.drawText(
+                    "⚽ TRAYECTORIA DE TIROS 2.4",
+                    getWidth()/2f,
+                    70,
+                    text
+            );
+
+            button(c,"🎯 NORMAL",120);
+            button(c,"🏆 RETOS",210);
+            button(c,"🧤 MODO PORTERO",300);
+            button(c,"🥅 PENALES",390);
+            button(c,"🎯 TIROS LIBRES",480);
+            button(c,"👤 1 VS 1",570);
+        }
+
+        private void button(
+                Canvas c,
+                String s,
+                float y
+        ) {
+
+            p.setColor(
+                    Color.rgb(32,132,67)
+            );
+
+            c.drawRoundRect(
+                    getWidth()*0.20f,
+                    y,
+                    getWidth()*0.80f,
+                    y+62,
+                    18,
+                    18,
+                    p
+            );
+
+            text.setTextSize(21);
+
+            text.setColor(Color.WHITE);
+
+            c.drawText(
+                    s,
+                    getWidth()/2f,
+                    y+40,
+                    text
+            );
+        }
+
+        /*
+         * CAMPO
+         */
+        private void drawGame(Canvas c) {
+
+            drawField(c);
+
+            drawGoal(c);
+
+            drawTrajectory(c);
+
+            drawPlayer(c);
+
+            drawKeeper(c);
+
+            drawBall(c);
+
+            drawHud(c);
+        }
+
+        private void drawField(Canvas c) {
+
+            c.drawColor(
+                    Color.rgb(42,150,69)
+            );
+
+            p.setColor(
+                    Color.rgb(34,126,57)
+            );
+
+            for (int i=0;i<8;i++) {
+
+                float y =
+                        20 +
+                        i *
+                        (getHeight()-40)/8f;
+
+                c.drawRect(
+                        20,
+                        y,
+                        getWidth()-20,
+                        y+18,
+                        p
+                );
+            }
+
+            stroke.setColor(
+                    Color.WHITE
+            );
+
+            stroke.setStrokeWidth(4);
+
+            c.drawRect(
+                    field,
+                    stroke
+            );
+
+            c.drawLine(
+                    getWidth()*0.50f,
+                    20,
+                    getWidth()*0.50f,
+                    getHeight()-20,
+                    stroke
+            );
+
+            c.drawCircle(
+                    getWidth()*0.50f,
+                    getHeight()/2f,
+                    75,
+                    stroke
+            );
+        }
+
+        /*
+         * PORTERÍA
+         */
+        private void drawGoal(Canvas c) {
+
+            float pulse =
+                    (float)Math.sin(
+                            goalPulse*Math.PI
+                    ) * 7;
+
+            stroke.setColor(
+                    Color.WHITE
+            );
+
+            stroke.setStrokeWidth(8);
+
+            c.drawRect(
+                    goal.left,
+                    goal.top + pulse,
+                    goal.right,
+                    goal.bottom + pulse,
+                    stroke
+            );
+        }
+
+        /*
+         * TRAYECTORIA
+         */
+        private void drawTrajectory(Canvas c) {
+
+            if (!shooting &&
+                    !shotResolved)
+                return;
+
+            path.reset();
+
+            path.moveTo(
+                    startX,
+                    startY
+            );
+
+            for (int i=1;i<=36;i++) {
+
+                float t =
+                        i / 36f;
+
+                float smooth =
+                        t*t*(3-2*t);
+
+                float x =
+                        startX +
+                        (targetX-startX)
+                        * smooth;
+
+                float y =
+                        startY +
+                        (targetY-startY)
+                        * smooth;
+
+                x +=
+                        (float)Math.sin(
+                                Math.PI*t
+                        )
+                        * curve * 3;
+
+                y -=
+                        (float)Math.sin(
+                                Math.PI*t
+                        )
+                        * (height/100f)
+                        * 250;
+
+                path.lineTo(x,y);
+            }
+
+            stroke.setColor(
+                    Color.rgb(
+                            255,
+                            235,
+                            65
+                    )
+            );
+
+            stroke.setStrokeWidth(4);
+
+            c.drawPath(
+                    path,
+                    stroke
+            );
+        }
+
+        /*
+         * JUGADOR
+         */
+        private void drawPlayer(Canvas c) {
+
+            float x =
+                    getWidth()*0.13f;
+
+            float y =
+                    getHeight()*0.60f;
+
+            float kick =
+                    playerT < 1
+                    ? (float)Math.sin(
+                            playerT*Math.PI
+                    ) * 24
+                    : 0;
+
+            p.setColor(Color.WHITE);
+
+            c.drawCircle(
+                    x,
+                    y-54,
+                    16,
+                    p
+            );
+
+            c.drawRect(
+                    x-17,
+                    y-38,
+                    x+17,
+                    y+12,
+                    p
+            );
+
+            stroke.setColor(
+                    Color.WHITE
+            );
+
+            stroke.setStrokeWidth(8);
+
+            c.drawLine(
+                    x,
+                    y+10,
+                    x-18-kick,
+                    y+55,
+                    stroke
+            );
+
+            c.drawLine(
+                    x,
+                    y+10,
+                    x+18+kick,
+                    y+55,
+                    stroke
+            );
+        }
+
+        /*
+         * PORTERO
+         */
+        private void drawKeeper(Canvas c) {
+
+            float x = keeperX;
+            float y = keeperY;
+
+            p.setColor(
+                    Color.rgb(
+                            35,
+                            92,
+                            185
+                    )
+            );
+
+            c.drawCircle(
+                    x,
+                    y-28,
+                    15,
+                    p
+            );
+
+            c.drawRect(
+                    x-17,
+                    y-13,
+                    x+17,
+                    y+30,
+                    p
+            );
+
+            float reach =
+                    diving ? 45 : 25;
+
+            stroke.setColor(
+                    Color.WHITE
+            );
+
+            stroke.setStrokeWidth(7);
+
+            c.drawLine(
+                    x,
+                    y,
+                    x-reach,
+                    y-18,
+                    stroke
+            );
+
+            c.drawLine(
+                    x,
+                    y,
+                    x+reach,
+                    y-18,
+                    stroke
+            );
+
+            c.drawLine(
+                    x,
+                    y+30,
+                    x-13,
+                    y+60,
+                    stroke
+            );
+
+            c.drawLine(
+                    x,
+                    y+30,
+                    x+13,
+                    y+60,
+                    stroke
+            );
+        }
+
+        /*
+         * BALÓN
+         */
+        private void drawBall(Canvas c) {
+
+            p.setColor(Color.WHITE);
+
+            c.drawCircle(
+                    ballX,
+                    ballY,
+                    12,
+                    p
+            );
+
+            p.setColor(Color.BLACK);
+
+            c.drawCircle(
+                    ballX,
+                    ballY,
+                    3,
+                    p
+            );
+        }
+
+        /*
+         * HUD
+         */
+        private void drawHud(Canvas c) {
+
+            text.setTextAlign(
+                    Paint.Align.LEFT
+            );
+
+            text.setTextSize(18);
+
+            text.setColor(Color.WHITE);
+
+            c.drawText(
+                    "Goles: " + goals,
+                    30,
+                    38,
+                    text
+            );
+
+            c.drawText(
+                    "Atajadas: " + saves,
+                    30,
+                    62,
+                    text
+            );
+
+            c.drawText(
+                    "Racha: " + streak +
+                    "  Récord: " + record,
+                    30,
+                    86,
+                    text
+            );
+
+            c.drawText(
+                    "Potencia: " +
+                    Math.round(power) +
+                    "  Curva: " +
+                    Math.round(curve) +
+                    "  Altura: " +
+                    Math.round(height),
+                    30,
+                    getHeight()-22,
+                    text
+            );
+        }
+
+        /*
+         * CONTROLES
+         */
+        @Override
+        public boolean onTouchEvent(
+                MotionEvent e
+        ) {
+
+            float x = e.getX();
+            float y = e.getY();
+
+            /*
+             * Movimiento continuo del portero.
+             */
+            if (
+                    e.getAction() ==
+                    MotionEvent.ACTION_MOVE &&
+                    mode == 2
+            ) {
+
+                moveKeeper(x,y);
+
+                return true;
+            }
+
+            if (
+                    e.getAction() !=
+                    MotionEvent.ACTION_DOWN
+            )
+                return true;
+
+            /*
+             * MENÚ
+             */
+            if (mode == 0) {
+
+                if (y >= 120 &&
+                    y < 182) {
+
+                    mode = 3;
+                    reset();
+
+                } else if (
+                    y >= 210 &&
+                    y < 272
+                ) {
+
+                    mode = 1;
+                    reset();
+
+                } else if (
+                    y >= 300 &&
+                    y < 362
+                ) {
+
+                    mode = 2;
+                    reset();
+
+                } else if (
+                    y >= 390 &&
+                    y < 452
+                ) {
+
+                    mode = 3;
+                    reset();
+
+                } else if (
+                    y >= 480 &&
+                    y < 542
+                ) {
+
+                    mode = 4;
+                    reset();
+
+                } else if (
+                    y >= 570 &&
+                    y < 632
+                ) {
+
+                    mode = 5;
+                    reset();
+                }
+
+                return true;
+            }
+
+            /*
+             * MODO PORTERO
+             */
+            if (mode == 2) {
+
+                moveKeeper(x,y);
+
+                if (x > goal.left) {
+
+                    keeperTX = x;
+                    keeperTY = y;
+
+                    clampTarget();
+
+                    diving = true;
+                    diveT = 0;
+                }
+
+                return true;
+            }
+
+            /*
+             * SELECCIONAR OBJETIVO
+             */
+            if (!shooting &&
+                x > getWidth()*0.52f) {
+
+                targetX = x;
+                targetY = y;
+
+                return true;
+            }
+
+            /*
+             * DISPARAR
+             */
+            if (!shooting &&
+                x < getWidth()*0.52f) {
+
+                shoot(
+                        targetX,
+                        targetY
+                );
+
+                return true;
+            }
+
+            return true;
+        }
+
+        /*
+         * MOVIMIENTO MANUAL DEL PORTERO
+         *
+         * Permite llegar a toda la portería,
+         * incluida la zona superior.
+         */
+        private void moveKeeper(
+                float x,
+                float y
+        ) {
+
+            keeperX =
+                    Math.max(
+                            goal.left+10,
+                            Math.min(
+                                    goal.right-10,
+                                    x
+                            )
+                    );
+
+            keeperY =
+                    Math.max(
+                            goal.top+10,
+                            Math.min(
+                                    goal.bottom-10,
+                                    y
+                            )
+                    );
+
+            keeperTX = keeperX;
+            keeperTY = keeperY;
+        }
+    }
+}
